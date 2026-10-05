@@ -11,7 +11,7 @@ import uuid
 load_dotenv()
 
 
-from app.database import create_inspection, save_detection , create_inspection, save_detection, get_all_defect_history
+from app.database import get_inspection_history , create_inspection, save_detection , create_inspection, save_detection, get_all_defect_history
 
 
 
@@ -126,24 +126,23 @@ class InspectionState(TypedDict):
     decision: dict
     policy_decision: dict
     pattern_analysis : dict 
+    reinspection_count : dict
 
 
 # ============================================================
 # 3. VISION NODE
 # ============================================================
 
+
 def vision_node(state: InspectionState):
     image_path = state["image_path"]
 
-    # Generate a unique ID for this inspection run
     inspection_id = str(uuid.uuid4())
 
-    # Use the image filename as the sample ID
     sample_id = os.path.splitext(
         os.path.basename(image_path)
     )[0]
 
-    # Run YOLO
     results = model(
         image_path,
         verbose=False,
@@ -152,14 +151,12 @@ def vision_node(state: InspectionState):
 
     detections: list[Detection] = []
 
-    # Store the inspection itself
     create_inspection(
         inspection_id=inspection_id,
         sample_id=sample_id,
         image_path=image_path,
     )
 
-    # Extract and store detections
     for result in results:
         if result.boxes is None:
             continue
@@ -191,10 +188,15 @@ def vision_node(state: InspectionState):
                 bbox=detection["bbox"],
             )
 
+    inspection_history = get_inspection_history()
+
     return {
         "detections": detections,
         "inspection_id": inspection_id,
+        "inspection_history": inspection_history,
     }
+
+
 # ----------------------------- DEFECT NODE ------------------------------------
 
 defect_analyzer = llm.with_structured_output(
@@ -427,18 +429,39 @@ Rules:
 1. Use ONLY the supplied historical statistics.
 2. Do not invent machine IDs, production lines,
    batches, shifts, dates, or causes.
-3. A repeated defect means that the defect has appeared
-   in previous ForgeSight inspections.
-4. Do not claim that historical occurrence proves a root cause.
-5. Do not make an ACCEPT or REJECT decision.
-6. If the historical evidence is weak, say so.
-7. Keep the analysis concise and technically defensible.
+3. inspection_count represents the number of distinct
+   inspection runs in which the defect class appeared.
+4. Do not interpret inspection_count as the number
+   of individual defect instances.
+5. Do not claim that historical occurrence proves a root cause.
+6. Do not make an ACCEPT or REJECT decision.
+7. If the historical evidence is weak, say so.
+8. Keep the analysis concise and technically defensible.
 """
 
     analysis = pattern_analyzer.invoke(prompt)
 
     return {
         "pattern_analysis": analysis.model_dump()
+    }
+
+def route_after_policy(state: InspectionState):
+    action = state["policy_decision"]["action"]
+
+    if action == "REINSPECT":
+        if state["reinspection_count"] < 2:
+            return "reinspect"
+
+        return "human_review"
+
+    if action == "HUMAN_REVIEW":
+        return "human_review"
+
+    return "end"
+
+def reinspection_node(state: InspectionState):
+    return {
+        "reinspection_count": state["reinspection_count"] + 1
     }
 
 # ============================================================
@@ -454,6 +477,10 @@ builder.add_node("quality_assessment", quality_assessment_node)
 builder.add_node("decision", decision_node)
 builder.add_node("policy_engine",policy_engine_node)
 builder.add_node("pattern_analysis" , pattern_analysis_node)
+builder.add_node(
+    "reinspect",
+    reinspection_node
+)
 
 builder.add_edge(START, "vision")
 
@@ -466,8 +493,15 @@ builder.add_edge("quality_assessment", "decision")
 builder.add_edge("pattern_analysis" , "decision")
 
 builder.add_edge("decision", "policy_engine")
-
-builder.add_edge("policy_engine", END)
+builder.add_conditional_edges(
+    "policy_engine",
+    route_after_policy,
+    {
+        "reinspect": "reinspect",
+        "human_review": END,
+        "end": END,
+    },
+)
 
 graph = builder.compile()
 

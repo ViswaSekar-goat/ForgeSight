@@ -101,7 +101,6 @@ def get_defect_history(class_name: str):
 
     return result
 
-
 def get_all_defect_history():
     connection = get_connection()
     cursor = connection.cursor(dictionary=True)
@@ -109,11 +108,35 @@ def get_all_defect_history():
     query = """
         SELECT
             class_name,
-            COUNT(*) AS occurrence_count,
+            COUNT(DISTINCT inspection_id) AS inspection_count,
             AVG(confidence) AS average_confidence
         FROM detections
         GROUP BY class_name
-        ORDER BY occurrence_count DESC
+        ORDER BY inspection_count DESC
+    """
+
+    cursor.execute(query)
+
+    results = cursor.fetchall()
+
+    cursor.close()
+    connection.close()
+
+    return results
+
+def get_inspection_history():
+    connection = get_connection()
+    cursor = connection.cursor(dictionary=True)
+
+    query = """
+        SELECT
+            inspection_id,
+            sample_id,
+            image_path,
+            created_at,
+            final_action
+        FROM inspections
+        ORDER BY created_at DESC
     """
 
     cursor.execute(query)
