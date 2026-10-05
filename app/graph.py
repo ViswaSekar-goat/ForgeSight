@@ -65,11 +65,51 @@ class DefectAnalysis(BaseModel):
         )
     )
 
+class QualityAssessment(BaseModel):
+    severity: str = Field(
+        description="Potential severity: LOW, MEDIUM, HIGH, or CRITICAL"
+    )
+
+    reasoning: str = Field(
+        description="Explain why this severity is suggested"
+    )
+
+    confidence_level: str = Field(
+        description="HIGH, MEDIUM, or LOW confidence in the assessment"
+    )
+
+    recommended_action: str = Field(
+        description="Suggested workflow action, not an authoritative final decision"
+    )
+
+class DecisionRecommendation(BaseModel):
+    decision: str = Field(
+        description=(
+            "Recommended action: ACCEPT, REJECT, REINSPECT, "
+            "or HUMAN_REVIEW"
+        )
+    )
+
+    reasoning: str = Field(
+        description="Explain how the evidence supports the recommendation"
+    )
+
+    conflicting_evidence: str = Field(
+        description="Mention any disagreement or uncertainty between the agents"
+    )
+
+    confidence: str = Field(
+        description="HIGH, MEDIUM, or LOW confidence in this recommendation"
+    )
 
 class InspectionState(TypedDict):
     image_path: str
     detections: list[Detection]
+    inspection_history: list[dict]
     defect_analysis: dict
+    quality_assessment: dict
+    decision: dict
+    policy_decision: dict
 
 
 # ============================================================
@@ -118,13 +158,12 @@ def vision_node(state: InspectionState):
     }
 
 
-# ============================================================
-# 4. DEFECT ANALYSIS AGENT
-# ============================================================
+# ----------------------------- DEFECT NODE ------------------------------------
 
 defect_analyzer = llm.with_structured_output(
     DefectAnalysis
 )
+
 
 
 def defect_analysis_node(state: InspectionState):
@@ -171,6 +210,149 @@ Human reviewer = safety override
         "defect_analysis": analysis.model_dump()
     }
 
+# ----------------------------- QUALITY NODE ------------------------------------
+
+quality_assessor = llm.with_structured_output(QualityAssessment)
+
+def quality_assessment_node(state: InspectionState):
+
+    prompt = f"""
+You are the Quality Assessment Agent in ForgeSight,
+an industrial visual inspection system.
+
+YOLO detections:
+{state["detections"]}
+
+Assess the potential quality severity.
+
+Rules:
+
+1. Use only the supplied evidence.
+2. Do not invent measurements or visual information.
+3. Consider detection confidence.
+4. Use one of:
+   LOW
+   MEDIUM
+   HIGH
+   CRITICAL
+5. Clearly distinguish severity from certainty.
+6. Do not make an authoritative ACCEPT or REJECT decision.
+7. If evidence is insufficient, recommend HUMAN_REVIEW or REINSPECTION.
+"""
+
+    assessment = quality_assessor.invoke(prompt)
+
+    return {
+        "quality_assessment": assessment.model_dump()
+    }
+
+# ----------------------------- DECISION NODE ------------------------------------
+decision_maker = llm.with_structured_output(
+    DecisionRecommendation
+)
+
+def decision_node(state: InspectionState):
+
+    prompt = f"""
+You are the Decision Agent in ForgeSight,
+an industrial visual inspection system.
+
+YOLO detections:
+{state["detections"]}
+
+Defect Analysis Agent:
+{state["defect_analysis"]}
+
+Quality Assessment Agent:
+{state["quality_assessment"]}
+
+Your job is to synthesize the available evidence.
+
+Possible recommendations:
+
+ACCEPT
+REJECT
+REINSPECT
+HUMAN_REVIEW
+
+Rules:
+
+1. Consider all available evidence.
+2. Do not invent information.
+3. Pay attention to YOLO confidence.
+4. Pay attention to uncertainty in the Defect Analysis.
+5. Pay attention to severity and confidence in the Quality Assessment.
+6. If the evidence is insufficient or conflicting, prefer
+   REINSPECT or HUMAN_REVIEW.
+7. This is a recommendation only.
+8. Do not claim that your recommendation is the authoritative
+   final production decision.
+"""
+
+    recommendation = decision_maker.invoke(prompt)
+
+    return {
+        "decision": recommendation.model_dump()
+    }
+
+# ----------------------------- POLICY NODE ------------------------------------
+
+
+LOW_CONFIDENCE = 0.50
+HIGH_CONFIDENCE = 0.75
+
+
+def policy_engine_node(state: InspectionState):
+
+    detections = state["detections"]
+
+    # No defects detected
+    if not detections:
+
+        return {
+            "policy_decision": {
+                "action": "ACCEPT",
+                "reason": "No defects were detected by the vision model.",
+                "authority": "deterministic_policy",
+            }
+        }
+
+    confidences = [
+        detection["confidence"]
+        for detection in detections
+    ]
+
+    # At least one uncertain detection
+    if any(confidence < LOW_CONFIDENCE for confidence in confidences):
+
+        return {
+            "policy_decision": {
+                "action": "REINSPECT",
+                "reason": "At least one detected defect has low confidence.",
+                "authority": "deterministic_policy",
+            }
+        }
+
+    # Strong visual evidence
+    if any(confidence >= HIGH_CONFIDENCE for confidence in confidences):
+
+        return {
+            "policy_decision": {
+                "action": "REJECT",
+                "reason": "At least one defect has high-confidence visual evidence.",
+                "authority": "deterministic_policy",
+            }
+        }
+
+    # Ambiguous middle region
+    return {
+        "policy_decision": {
+            "action": "HUMAN_REVIEW",
+            "reason": "Defect evidence is present but does not meet a deterministic threshold.",
+            "authority": "deterministic_policy",
+        }
+    }
+
 
 # ============================================================
 # 5. BUILD LANGGRAPH
@@ -179,33 +361,26 @@ Human reviewer = safety override
 builder = StateGraph(InspectionState)
 
 
-# Register nodes
-builder.add_node(
-    "vision",
-    vision_node,
+builder.add_node("vision", vision_node)
+builder.add_node("defect_analysis", defect_analysis_node)
+builder.add_node("quality_assessment", quality_assessment_node)
+builder.add_node("decision", decision_node)
+builder.add_node("policy_engine",policy_engine_node,
 )
 
-builder.add_node(
-    "defect_analysis",
-    defect_analysis_node,
-)
+builder.add_edge(START, "vision")
 
+builder.add_edge("vision", "defect_analysis")
+builder.add_edge("vision", "quality_assessment")
 
-# Define flow
-builder.add_edge(
-    START,
-    "vision",
-)
+builder.add_edge("defect_analysis", "decision")
+builder.add_edge("quality_assessment", "decision")
 
-builder.add_edge(
-    "vision",
-    "defect_analysis",
-)
+builder.add_edge("decision", "policy_engine")
 
-builder.add_edge(
-    "defect_analysis",
-    END,
-)
+builder.add_edge("policy_engine", END)
+
+graph = builder.compile()
 
 
 # Compile graph
